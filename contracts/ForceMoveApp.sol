@@ -4,7 +4,7 @@ pragma experimental ABIEncoderV2;
 import "@statechannels/nitro-protocol/contracts/interfaces/IForceMoveApp.sol";
 import "hardhat/console.sol";
 
-contract Scorched is IForceMoveApp {
+contract ForceMoveApp is IForceMoveApp {
   function validTransition(
     VariablePart memory a,
     VariablePart memory b,
