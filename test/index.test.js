@@ -11,6 +11,8 @@ const {
   Transactions,
   hashAppPart,
   encodeOutcome,
+  signChallengeMessage,
+  hashState,
 } = require('@statechannels/nitro-protocol')
 
 function createOutcome(balances, adjudicator) {
@@ -90,6 +92,430 @@ async function createIntermediaryChannel(irene, other, adjudicator, app) {
 }
 
 describe('Virtual Funding', function () {
+  it('should non-cooperatively defund a virtual channel', async () => {
+    const NitroAdjudicator = await ethers.getContractFactory('NitroAdjudicator')
+    const adjudicator = await NitroAdjudicator.deploy()
+    await adjudicator.deployed()
+
+    const ForceMoveApp = await ethers.getContractFactory('ForceMoveApp')
+    const app = await ForceMoveApp.deploy()
+    await app.deployed()
+
+    const [ funding ] = await ethers.getSigners()
+    const [ irene, bob, alice ] = [
+      ethers.Wallet.createRandom(),
+      ethers.Wallet.createRandom(),
+      ethers.Wallet.createRandom(),
+    ].map(wallet => wallet.connect(funding.provider))
+    for (const wallet of [irene, bob, alice]) {
+      const tx = await funding.sendTransaction({
+        to: wallet.address,
+        value: ethers.utils.parseEther('1'),
+      })
+      await tx.wait()
+    }
+
+    const {
+      channelId: bobChannelId,
+      channel: bobChannel,
+      outcome: bobOutcome
+    } = await createIntermediaryChannel(irene, bob, adjudicator, app)
+    const {
+      channelId: aliceChannelId,
+      channel: aliceChannel,
+      outcome: aliceOutcome,
+    } = await createIntermediaryChannel(irene, alice, adjudicator, app)
+
+    // now create a 3 person channel. Irene will need to consent to this
+
+    const interChannel = {
+      chainId: '0x1234',
+      channelNonce: BigNumber.from(0).toHexString(),
+      participants: [irene.address, bob.address, alice.address],
+    }
+
+    let interSigs = []
+    let interStates = []
+
+    const depositAmount = BigNumber.from(100)
+    const startingOutcome = createOutcome([
+      {
+        address: irene.address,
+        amount: depositAmount.mul(2),
+      },
+      {
+        address: bob.address,
+        amount: depositAmount,
+      },
+      {
+        address: alice.address,
+        amount: depositAmount,
+      },
+    ], adjudicator)
+    const baseState = {
+      isFinal: false,
+      channel: interChannel,
+      outcome: startingOutcome,
+      appDefinition: app.address,
+      appData: ethers.constants.HashZero,
+      challengeDuration: 1,
+    }
+    const interChannelId = getChannelId(interChannel)
+    let whoSignedWhat = [0,1,2]
+    interSigs = await signStates([
+      {
+        ...baseState,
+        turnNum: 0,
+      },
+      {
+        ...baseState,
+        turnNum: 1,
+      },
+      {
+        ...baseState,
+        turnNum: 2,
+      }
+    ], [irene, bob, alice], whoSignedWhat)
+    // now all three have agreed to the inter channel
+    // now convince Irene to fund this channel
+    // any new outcome that doesn't jeopardise her funds should be fine
+
+    // just the latest two
+    let ireneBobSigs = []
+    let ireneBobStates = []
+    let ireneAliceSigs = []
+    let ireneAliceStates = []
+
+    const baseDepositAmount = BigNumber.from(1000)
+    {
+      // update bob channel state
+      // bob and alice need to deposit or in order of payment priority for
+      // guarantor claims
+      const state = {
+        isFinal: false,
+        channel: bobChannel,
+        outcome: createOutcome([
+          {
+            address: irene.address,
+            amount: baseDepositAmount.sub(depositAmount),
+          },
+          {
+            address: bob.address,
+            amount: baseDepositAmount.sub(depositAmount),
+          },
+          {
+            address: interChannelId,
+            amount: depositAmount.mul(2),
+          }
+        ], adjudicator),
+        appDefinition: app.address,
+        appData: ethers.constants.HashZero,
+        challengeDuration: 1,
+      }
+      const state0 = {
+        ...state,
+        turnNum: 2,
+      }
+      const state1 = {
+        ...state,
+        turnNum: 3,
+      }
+      ireneBobStates = [state0, state1]
+      whoSignedWhat = [0,1]
+      ireneBobSigs = await signStates(ireneBobStates, [irene, bob], whoSignedWhat)
+    }
+    {
+      const state = {
+        isFinal: false,
+        channel: aliceChannel,
+        outcome: createOutcome([
+          {
+            address: irene.address,
+            amount: baseDepositAmount.sub(depositAmount),
+          },
+          {
+            address: alice.address,
+            amount: baseDepositAmount.sub(depositAmount),
+          },
+          {
+            address: interChannelId,
+            amount: depositAmount.mul(2),
+          }
+        ], adjudicator),
+        appDefinition: app.address,
+        appData: ethers.constants.HashZero,
+        challengeDuration: 1,
+      }
+      const state0 = {
+        ...state,
+        turnNum: 2,
+      }
+      const state1 = {
+        ...state,
+        turnNum: 3,
+      }
+      ireneAliceStates = [state0, state1]
+      whoSignedWhat = [0,1]
+      ireneAliceSigs = await signStates(ireneAliceStates, [irene, alice], whoSignedWhat)
+    }
+    // now the inter channel is funded
+    // we need a channel just for bob and alice
+    const bobAliceChannel = {
+      chainId: '0x1234',
+      channelNonce: BigNumber.from(0).toHexString(),
+      participants: [bob.address, alice.address],
+    }
+    const bobAliceChannelId = getChannelId(bobAliceChannel)
+    const bobAliceOutcome = createOutcome([
+      {
+        address: bob.address,
+        amount: depositAmount,
+      },
+      {
+        address: alice.address,
+        amount: depositAmount,
+      }
+    ], adjudicator)
+    const bobAliceState = {
+      isFinal: false,
+      channel: bobAliceChannel,
+      outcome: bobAliceOutcome,
+      appDefinition: app.address,
+      appData: ethers.constants.HashZero,
+      challengeDuration: 1,
+    }
+    whoSignedWhat = [0,1]
+    let bobAliceSigs = await signStates([
+      {
+        ...bobAliceState,
+        turnNum: 0,
+      },
+      {
+        ...bobAliceState,
+        turnNum: 1,
+      },
+    ], [bob, alice], whoSignedWhat)
+
+    // new we set the inter channel to fund the bob alice channel
+    const interNextOutcome = createOutcome([
+      {
+        address: irene.address,
+        amount: depositAmount.mul(2),
+      },
+      {
+        address: bob.address,
+        amount: BigNumber.from(0),
+      },
+      {
+        address: alice.address,
+        amount: BigNumber.from(0),
+      },
+      {
+        address: bobAliceChannelId,
+        amount: depositAmount.mul(2),
+      },
+    ], adjudicator)
+    const interNextState = {
+      isFinal: false,
+      channel: interChannel,
+      outcome: interNextOutcome,
+      appDefinition: app.address,
+      appData: ethers.constants.HashZero,
+      challengeDuration: 1,
+    }
+    whoSignedWhat = [0,1,2]
+    interStates = [
+      {
+        ...interNextState,
+        turnNum: 3,
+      },
+      {
+        ...interNextState,
+        turnNum: 4,
+      },
+      {
+        ...interNextState,
+        turnNum: 5,
+      }
+    ]
+    interSigs = await signStates(interStates, [irene, bob, alice], whoSignedWhat)
+
+    // now the bob-alice channel is funded
+    const aliceInterPay = depositAmount.mul(2).sub(10)
+    const bobInterPay = BigNumber.from(10)
+
+    const bobAliceNextOutcome = createOutcome([
+      {
+        address: bob.address,
+        amount: bobInterPay,
+      },
+      {
+        address: alice.address,
+        amount: aliceInterPay,
+      }
+    ], adjudicator)
+    const bobAliceNextState = {
+      isFinal: false,
+      channel: bobAliceChannel,
+      outcome: bobAliceNextOutcome,
+      appDefinition: app.address,
+      appData: ethers.constants.HashZero,
+      challengeDuration: 1,
+    }
+    whoSignedWhat = [0,1]
+    const bobAliceStates = [
+      {
+        ...bobAliceNextState,
+        turnNum: 2,
+      },
+      {
+        ...bobAliceNextState,
+        turnNum: 3,
+      },
+    ]
+    bobAliceSigs = await signStates(bobAliceStates, [bob, alice], whoSignedWhat)
+
+    // now assume all refuse to send more signatures
+    // start by creating challenges in the ledger channels
+    const bobChallengeTx = await adjudicator.connect(funding).challenge(
+      getFixedPart(ireneBobStates[1]),
+      ireneBobStates[1].turnNum,
+      ireneBobStates.map(state => getVariablePart(state)),
+      0,
+      ireneBobSigs,
+      [0, 1],
+      signChallengeMessage(
+        [signState(ireneBobStates[1], bob.privateKey)],
+        bob.privateKey
+      )
+    )
+    await bobChallengeTx.wait()
+
+    const aliceChallengeTx = await adjudicator.connect(funding).challenge(
+      getFixedPart(ireneAliceStates[1]),
+      ireneAliceStates[1].turnNum,
+      ireneAliceStates.map(state => getVariablePart(state)),
+      0,
+      ireneAliceSigs,
+      [0, 1],
+      signChallengeMessage(
+        [signState(ireneAliceStates[1], alice.privateKey)],
+        alice.privateKey
+      )
+    )
+    await aliceChallengeTx.wait()
+
+    // now the ledger channels are finalized, let's defund the inter channel
+
+    const interChallengeTx = await adjudicator.connect(funding).challenge(
+      getFixedPart(interStates[2]),
+      interStates[2].turnNum,
+      interStates.map(state => getVariablePart(state)),
+      0,
+      interSigs,
+      [0, 1, 2],
+      signChallengeMessage(
+        [signState(interStates[2], irene.privateKey)],
+        irene.privateKey
+      )
+    )
+    await interChallengeTx.wait()
+
+    // now the inter channel has been finalized, lets finalize the alice bob channel
+
+    const bobAliceChallengeTx = await adjudicator.connect(funding).challenge(
+      getFixedPart(bobAliceStates[1]),
+      bobAliceStates[1].turnNum,
+      bobAliceStates.map(state => getVariablePart(state)),
+      0,
+      bobAliceSigs,
+      [0, 1],
+      signChallengeMessage(
+        [signState(bobAliceStates[1], alice.privateKey)],
+        alice.privateKey,
+      )
+    )
+    await bobAliceChallengeTx.wait()
+
+    // now we can execute the relevant claims
+
+    // bob ledger channel
+    {
+      const bobStart = await bob.getBalance()
+      const ireneStart = await irene.getBalance()
+      const bobExpected = bobStart.add(baseDepositAmount.sub(depositAmount))
+      const ireneExpected = ireneStart.add(baseDepositAmount.sub(depositAmount))
+      const bobTransferTx = await adjudicator.connect(funding).transferAllAssets(
+        bobChannelId,
+        encodeOutcome(ireneBobStates[1].outcome),
+        hashState(ireneBobStates[1])
+      )
+      await bobTransferTx.wait()
+      const bobFinal = await bob.getBalance()
+      const ireneFinal = await irene.getBalance()
+      assert.equal(bobFinal.toString(), bobExpected.toString(), 'Bob ledger withdraw incorrect')
+      assert.equal(ireneFinal.toString(), ireneExpected.toString(), 'Irene ledger withdraw incorrect')
+    }
+
+    // alice ledger channel
+    {
+      const aliceStart = await alice.getBalance()
+      const ireneStart = await irene.getBalance()
+      const aliceExpected = aliceStart.add(baseDepositAmount.sub(depositAmount))
+      const ireneExpected = ireneStart.add(baseDepositAmount.sub(depositAmount))
+      const aliceTransferTx = await adjudicator.connect(funding).transferAllAssets(
+        aliceChannelId,
+        encodeOutcome(ireneAliceStates[1].outcome),
+        hashState(ireneAliceStates[1])
+      )
+      await aliceTransferTx.wait()
+      const aliceFinal = await alice.getBalance()
+      const ireneFinal = await irene.getBalance()
+      assert.equal(aliceFinal.toString(), aliceExpected.toString(), 'Alice ledger withdraw incorrect')
+      assert.equal(ireneFinal.toString(), ireneExpected.toString(), 'Irene ledger withdraw incorrect')
+    }
+
+    // inter channel
+    {
+      const bobStart = await bob.getBalance()
+      const aliceStart = await alice.getBalance()
+      const ireneStart = await irene.getBalance()
+      const bobExpected = bobStart.add(0)
+      const aliceExpected = aliceStart.add(0)
+      const ireneExpected = ireneStart.add(depositAmount.mul(2))
+      const interTransferTx = await adjudicator.connect(funding).transferAllAssets(
+        interChannelId,
+        encodeOutcome(interStates[2].outcome),
+        hashState(interStates[2])
+      )
+      await interTransferTx.wait()
+      const bobFinal = await bob.getBalance()
+      const aliceFinal = await alice.getBalance()
+      const ireneFinal = await irene.getBalance()
+      assert.equal(bobFinal.toString(), bobExpected.toString(), 'Bob inter withdraw incorrect')
+      assert.equal(aliceFinal.toString(), aliceExpected.toString(), 'Alice inter withdraw incorrect')
+      assert.equal(ireneFinal.toString(), ireneExpected.toString(), 'Irene inter withdraw incorrect')
+    }
+
+    // bob-alice channel
+    {
+      const bobStart = await bob.getBalance()
+      const aliceStart = await alice.getBalance()
+      const bobExpected = bobStart.add(bobInterPay)
+      const aliceExpected = aliceStart.add(aliceInterPay)
+      const bobAliceTransferTx = await adjudicator.connect(funding).transferAllAssets(
+        bobAliceChannelId,
+        encodeOutcome(bobAliceStates[1].outcome),
+        hashState(bobAliceStates[1])
+      )
+      await bobAliceTransferTx.wait()
+      const bobFinal = await bob.getBalance()
+      const aliceFinal = await alice.getBalance()
+      assert.equal(bobFinal.toString(), bobExpected.toString(), 'Bob withdraw incorrect')
+      assert.equal(aliceFinal.toString(), aliceExpected.toString(), 'Alice withdraw incorrect')
+    }
+  })
+
   it('should fund a channel between alice and bob offchain', async () => {
     const NitroAdjudicator = await ethers.getContractFactory('NitroAdjudicator')
     const adjudicator = await NitroAdjudicator.deploy()
@@ -132,7 +558,7 @@ describe('Virtual Funding', function () {
       participants: [irene.address, bob.address, alice.address],
     }
 
-    let iterSigs = []
+    let interSigs = []
 
     const depositAmount = BigNumber.from(100)
     const startingOutcome = createOutcome([
@@ -322,15 +748,15 @@ describe('Virtual Funding', function () {
     interSigs = await signStates([
       {
         ...interNextState,
+        turnNum: 3,
+      },
+      {
+        ...interNextState,
         turnNum: 4,
       },
       {
         ...interNextState,
         turnNum: 5,
-      },
-      {
-        ...interNextState,
-        turnNum: 6,
       }
     ], [irene, bob, alice], whoSignedWhat)
 
